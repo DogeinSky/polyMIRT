@@ -1,0 +1,967 @@
+---
+title: "Simulation_study"
+format: html
+editor: visual
+---
+
+```{r}
+library(MASS) # mvrnorm() used
+library(progress) # used for progress bar
+library(clue) # solve_LSAP() from it is used for finding A_best
+library(GPArotation) # GPFoblq() used for geomin rotation
+library(parallel)
+
+source("../R/Basics.R")
+source("../R/Modeling.R")
+source("../R/Simulation.R")
+source("../R/Plotting.R")
+#source("../R/poly_mirt_wrappers.R")
+#library(Rcpp)
+#sourceCpp("../R/poly_mirt_rcpp.cpp")
+
+J_values <- seq(100,500,100)
+sample_values <- c(10,25)
+K_values <- 10
+rho_set <- "high"
+nSim <- 50
+C=5
+```
+
+```{r}
+rotation_result <- data.frame(J = integer(), sample_coef = integer(), K = integer(), rho = character(),
+                              prob_diff = numeric(), tau_diff = numeric(), Theta_diff = numeric(),
+                              sens=numeric(), spec=numeric(), load_diff = numeric(), rho_diff = numeric(),
+                              method=character())
+
+cl <- makeCluster(5)
+clusterSetRNGStream(cl, 2026)   # independent worker RNG streams
+
+# workers append one line per finished replicate; watch live with
+#   tail -f GRM_sim_progress.log   (in Terminal, from the Simulation folder)
+prog_file <- file.path(getwd(), "GRM_sim_progress.log")
+unlink(prog_file)
+
+clusterEvalQ(cl, {
+  Sys.setenv(
+    VECLIB_MAXIMUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    OMP_NUM_THREADS        = "1"
+  )
+
+  library(MASS)
+  library(clue)
+  library(GPArotation)
+  
+  setwd("/Users/travisyang/PhD/Repos_work/Poly_MIRT")
+  library(Rcpp)
+  sourceCpp("R/poly_mirt_rcpp.cpp")
+
+  NULL
+})
+funcs <- ls(envir = .GlobalEnv)
+funcs <- funcs[sapply(funcs, function(f) is.function(get(f)))]
+# Rcpp-compiled functions must NOT be exported. Their bodies are
+# .Call(<pointer: 0x..>, ..) and the pointer is NULL in another process, so
+# exporting them clobbers the copies sourceCpp() just built on the worker and
+# the next call fails with "NULL value passed as symbol address".
+rcpp_exports <- c("compute_PFf","tau_stats_grm","compute_H_gpcm","compute_H_grm",
+                  "compute_Z_grm_cpp","init_M_tilde","logl_grm","logl_gpcm")
+funcs <- setdiff(funcs, rcpp_exports)
+funcs <- c(funcs, "mvrnorm","solve_LSAP","GPFoblq")
+clusterExport(cl, funcs)
+
+for (J in J_values){
+  for (sample_coef in sample_values){
+    for (K in K_values){
+      for (rho_value in rho_set){
+        A_true <- generate_A(J,K,zero_prob=0.7)
+        tau_true <- generate_tau(J,C)
+        rho <- switch(
+            rho_value,
+            orth = 0,
+            low  = c(0.1, 0.3),
+            high = c(0.4, 0.6)
+          )
+        # draw the pairwise correlations ONCE per cell, so all nSim
+        # replicates share the same true correlation matrix
+        if (length(rho) == 2) {
+          rho <- runif(K*(K-1)/2, rho[1], rho[2])
+        }
+        clusterExport(cl, varlist=c("J", "C","sample_coef", "K","A_true","tau_true", "rho_value","rho","prog_file"))
+        
+        df_ls <- parLapplyLB(cl, 1:nSim, function(i){
+          N=sample_coef*J
+
+          Data <- generate_data(N,J,rho=rho,A_true,model="GRM",C=C,tau_true=tau_true)
+          Y <- Data$Y
+          
+          result <- GRM_HiMMIRT(Y,K,C,alpha=1,rotation=T,max_iter=200,tol=1e-5)
+
+          # Rotation baseline. The threshold is fixed without reference to the
+          # truth, so this is the honest counterpart to choosing a lambda; the
+          # refit then uses the same masked machinery as lasso_BIC / Seq_ITC,
+          # leaving the selection rule as the only difference.
+          res_thr   <- result
+          res_thr$A <- ifelse(abs(result$A) < 0.3, 0, result$A)
+          vec_thr   <- calResults(res_thr, Data, N, J, K, C, model = "GRM")[1:7]
+
+          Lambda_rot <- ifelse(res_thr$A == 0, 0, 1)
+          res_refit  <- GRM_CHiMIRT(Y, result, Lambda_rot, K,
+                                    orthogonal = T,
+                                    max_iter = 2000, tol = 1e-5)
+          vec_refit  <- calResults(res_refit, Data, N, J, K, C, model = "GRM")[1:7]
+
+          out <- as.data.frame(rbind(vec_thr, vec_refit))
+          rownames(out) <- NULL
+          out$method <- c("rot_thr", "rot_refit")
+
+          cat(sprintf("J=%d sc=%d K=%d rho=%s rep=%d  %s\n",
+                      J, sample_coef, K, rho_value, i,
+                      format(Sys.time(), "%H:%M:%S")),
+              file = prog_file, append = TRUE)
+
+          out
+        })
+
+        df_cell <- do.call(rbind, df_ls)
+        df_cell$J           <- J
+        df_cell$sample_coef <- sample_coef
+        df_cell$K           <- K
+        df_cell$rho         <- rho_value
+
+        rotation_result <- rbind(rotation_result,
+                                 df_cell[, names(rotation_result)])
+      }
+    }
+  }
+}
+
+stopCluster(cl)
+saveRDS(rotation_result, "GRM_rotation_result.rds")
+
+aggregate(cbind(prob_diff, load_diff, sens, spec) ~ method,
+          data = rotation_result, FUN = mean)
+
+```
+
+```{r}
+GRM_simu_result <- data.frame(J = integer(), sample_coef = integer(), K = integer(), rho = character(), method=character(),
+                              prob_diff = numeric(), tau_diff = numeric(), Theta_diff = numeric(),
+                              sens=numeric(), spec=numeric(), load_diff = numeric(), card_diff = numeric(), rho_diff = numeric(),
+                              BIC = numeric(),time=numeric())
+
+cl <- makeCluster(6)
+clusterSetRNGStream(cl, 2026)   # independent worker RNG streams
+
+# workers append one line per finished replicate; watch live with
+#   tail -f GRM_sim_progress.log   (in Terminal, from the Simulation folder)
+prog_file <- file.path(getwd(), "GRM_sim_progress.log")
+unlink(prog_file)
+
+clusterEvalQ(cl, {
+  Sys.setenv(
+    VECLIB_MAXIMUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    OMP_NUM_THREADS        = "1"
+  )
+
+  library(MASS)
+  library(clue)
+  library(GPArotation)
+  
+  setwd("/Users/travisyang/PhD/Repos_work/Poly_MIRT")
+  library(Rcpp)
+  sourceCpp("R/poly_mirt_rcpp.cpp")
+
+  NULL
+})
+funcs <- ls(envir = .GlobalEnv)
+funcs <- funcs[sapply(funcs, function(f) is.function(get(f)))]
+# Rcpp-compiled functions must NOT be exported. Their bodies are
+# .Call(<pointer: 0x..>, ..) and the pointer is NULL in another process, so
+# exporting them clobbers the copies sourceCpp() just built on the worker and
+# the next call fails with "NULL value passed as symbol address".
+rcpp_exports <- c("compute_PFf","tau_stats_grm","compute_H_gpcm","compute_H_grm",
+                  "compute_Z_grm_cpp","init_M_tilde","logl_grm","logl_gpcm")
+funcs <- setdiff(funcs, rcpp_exports)
+funcs <- c(funcs, "mvrnorm","solve_LSAP","GPFoblq")
+clusterExport(cl, funcs)
+
+for (J in J_values){
+  for (sample_coef in sample_values){
+    for (K in K_values){
+      for (rho_value in rho_set){
+        A_true <- generate_A(J,K,zero_prob=0.8)
+        tau_true <- generate_tau(J,C)
+        rho <- switch(
+            rho_value,
+            orth = 0,
+            low  = c(0.1, 0.4),
+            high = c(0.4, 0.6)
+          )
+        # draw the pairwise correlations ONCE per cell, so all nSim
+        # replicates share the same true correlation matrix
+        if (length(rho) == 2) {
+          rho <- runif(K*(K-1)/2, rho[1], rho[2])
+        }
+        clusterExport(cl, varlist=c("J", "C","sample_coef", "K","A_true","tau_true", "rho_value","rho","prog_file"))
+        
+        df_ls <- parLapplyLB(cl, 1:nSim, function(i){
+          N=sample_coef*J
+
+          Data <- generate_data(N,J,rho=rho,A_true,model="GRM",C=C,tau_true=tau_true)
+          Y <- Data$Y
+          
+          orthogonal <- ifelse(rho_value=="orth", TRUE, FALSE)
+          
+          time_rot <- system.time({
+            result_rot <- GRM_HiMMIRT(Y,K,C,alpha=1,rotation=T,max_iter=2000,tol=1e-5)
+          
+            result_rot$A <- ifelse(abs(result_rot$A) < 0.3, 0, result_rot$A)
+            Lambda_rot <- ifelse(result_rot$A == 0, 0, 1)
+            
+            result_rot_refit  <- GRM_CHiMIRT(Y, result_rot, Lambda_rot, K,
+                                             orthogonal = orthogonal,
+                                      max_iter = 2000, tol = 1e-5)
+          })[3]
+          
+          vec_rot  <- calResults(result_rot_refit, Data, N, J, K, C, model = "GRM")
+          
+          lambda_max <- ifelse(sample_coef==10,J*2,J*3)
+          if (rho_value == "high") {
+            lambda_max <-ifelse(sample_coef==10,lambda_max, lambda_max*1.5)
+          }
+
+          # shared warm start (used by card, autolasso, and the refits)
+          time_init <- system.time({
+            Params <- GRM_HiMMIRT(Y,K,C,alpha=1,rotation=T,max_iter=200,tol=1e-3)
+          })[3]
+
+          time_lasso <- system.time({
+            result_list <- GRM_autolasso_HiMIRT(Y,K,C,Params=Params,try_out=15,
+                                                lambda_range=c(0,lambda_max),
+                                                orthogonal=orthogonal)
+            # only card_diff and BIC are used to pick a lambda; calSelect()
+            # returns exactly those, skipping ref.perp() and the two
+            # N x J x C probability arrays calResults() would build per call
+            df <- as.data.frame(t(sapply(1:(length(result_list)-1),
+                        function(i) calSelect(result_list[[i]], Data, N, K))))
+
+            oracle_num <- which.min(df$card_diff)
+            BIC_num <- which.min(df$BIC)
+          })[3]
+
+          Lambda_oracle <- ifelse(result_list[[oracle_num]]$A==0,0,1)
+          Lambda_BIC <- ifelse(result_list[[BIC_num]]$A==0,0,1)
+
+          time_refit_BIC <- system.time({
+            result_BIC <- GRM_CHiMIRT(Y,Params,Lambda_BIC,K,
+                                      orthogonal=orthogonal,
+                                      max_iter=200,tol=1e-5)
+          })[3]
+          vec_BIC <- calResults(result_BIC,Data,N,J,K,C,model="GRM")
+
+          if (identical(Lambda_oracle,Lambda_BIC)){
+            time_refit_oracle <- time_refit_BIC   # same refit serves both
+            vec_oracle <- vec_BIC
+          } else {
+            time_refit_oracle <- system.time({
+              result_oracle <- GRM_CHiMIRT(Y,Params,Lambda_oracle,K,
+                                          orthogonal=orthogonal,
+                                          max_iter=200,tol=1e-5)
+            })[3]
+            vec_oracle <- calResults(result_oracle,Data,N,J,K,C,model="GRM")
+          }
+
+
+          time_seq <- system.time({
+            result_seq <- GRM_card_HiMIRT(Y,K,C,Params=result_BIC,
+                                        random_start=F,
+                                        kappaC=sum(Lambda_BIC!=0),
+                                        orthogonal=orthogonal, tol=1e-5,
+                                        alpha=1,max_iter=200)
+
+            # iterative thresholding: drop nonzero loadings below .3,
+            # refit with the reduced cardinality, repeat
+            repeat {
+              small_num <- sum(abs(result_seq$A)<.3 & result_seq$A!=0)
+              kappaC_new <- sum(result_seq$A!=0)-small_num
+              if (small_num==0 || kappaC_new<K) break
+              result_seq <- GRM_card_HiMIRT(Y,K,C,Params=result_seq,
+                                          random_start=F,
+                                          kappaC=kappaC_new,
+                                          orthogonal=orthogonal, tol=1e-5,
+                                          alpha=1,max_iter=200)
+            }
+          })[3]
+
+          vec_seq <- calResults(result_seq,Data,N,J,K,C,model="GRM")
+
+          simu_res <- as.data.frame(rbind(vec_rot, vec_oracle, 
+                                          vec_BIC, vec_seq))
+          simu_res$J <- J
+          simu_res$sample_coef <- sample_coef
+          simu_res$K <- K
+          simu_res$rho <- rho_value
+          simu_res$method <- c("rotation","lasso_oracle",
+                               "lasso_BIC","Seq_ITC")
+          pipe_common <- time_init+time_lasso
+          simu_res$time <- c(time_rot,
+                             pipe_common+time_refit_oracle,
+                             pipe_common+time_refit_BIC,
+                             pipe_common+time_refit_BIC+time_seq)
+
+          cat(sprintf("%s  J=%d K=%d rho=%s  rep %d done\n",
+                      format(Sys.time(), "%H:%M:%S"), J, K, rho_value, i),
+              file = prog_file, append = TRUE)
+
+          return(simu_res)
+        })
+
+        res <- as.data.frame(do.call(rbind, df_ls))
+        GRM_simu_result <- rbind(GRM_simu_result,res)
+        
+        print(sprintf("J= %d tau= %.1f K= %d rho=%s  finished",
+                      J, sample_coef, K, rho_value))
+      }
+    }
+  }
+}
+
+stopCluster(cl)
+
+saveRDS(GRM_simu_result,"./Data/GRM_simu_result_80.rds")
+
+GRM_simu_result <- readRDS("./Data/GRM_simu_result_80.rds")
+
+for (rho in rho_set) {
+  GRM_simu_result_group <- GRM_simu_result[
+    GRM_simu_result$method == "lasso_oracle" &
+    GRM_simu_result$rho == rho,
+  ]
+
+  plot_GRM_results(
+    GRM_simu_result_group,
+    save_path = paste0("./Images/GRM_lasso_oracle_rho_", rho)
+  )
+}
+
+GRM_simu_result_seq <- GRM_simu_result[GRM_simu_result$method=="Seq_ITC",]
+plot_GRM_results(
+  GRM_simu_result_seq,
+  save_path = "./Images/GRM_seq_sparser"
+)
+
+library(dplyr)
+library(tidyr)
+
+# mean sens/spec per condition, SPLIT over rho (averaged over replicates
+# only); one "sens/spec" string per cell. Rows are grouped by rho, then
+# tau_N and K; columns by method, then J.
+methods_keep <- c("rotation", "lasso_BIC", "Seq_ITC")
+rho_order    <- c("orth", "low", "high")
+
+GRM_sens_spec <- GRM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho = droplevels(factor(rho, levels = union(rho_order, unique(rho))))) %>%
+  group_by(rho, method, sample_coef, K, J) %>%
+  summarise(sens = mean(sens, na.rm = TRUE),
+            spec = mean(spec, na.rm = TRUE), .groups = "drop") %>%
+  mutate(cell   = sprintf("%.3f/%.3f", sens, spec),
+         method = factor(method, levels = methods_keep)) %>%
+  select(-sens, -spec) %>%
+  pivot_wider(names_from = c(method, J), values_from = cell,
+              names_sort = TRUE, names_sep = "_J") %>%
+  arrange(rho, sample_coef, K)
+
+J_levels <- sort(unique(GRM_simu_result$J))
+
+library(ggplot2)
+
+plot_df <- GRM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho    = droplevels(factor(rho, levels = union(rho_order, unique(rho)))),
+         method = factor(method, levels = methods_keep))
+
+med <- function(x) median(x, na.rm = TRUE)   # NA rows must not blank a median
+
+panel <- function(df, metric, ylab, ylim = NULL) {
+  ggplot(df, aes(factor(J), .data[[metric]], colour = method)) +
+    geom_hline(yintercept = 1, linetype = 3, colour = "grey65") +
+    geom_point(position = position_jitterdodge(jitter.width = 0.18,
+                                               dodge.width = 0.6),
+               alpha = 0.15, size = 0.7, show.legend = FALSE) +
+    stat_summary(fun = med, geom = "line", aes(group = method),
+                 position = position_dodge(0.6), linewidth = 0.5) +
+    stat_summary(fun = med, geom = "point", size = 2,
+                 position = position_dodge(0.6)) +
+    facet_grid(rho ~ sample_coef + K, labeller = label_both) +
+    coord_cartesian(ylim = ylim) +
+    labs(x = "J", y = ylab) +
+    guides(colour = guide_legend(ncol = 1,
+                                 override.aes = list(alpha = 1, size = 2.2))) +
+    theme_bw(base_size = 9) +
+    theme(legend.position     = "right",
+          legend.direction    = "vertical",
+          legend.key.size     = unit(9, "pt"),
+          legend.title        = element_text(size = 8),
+          legend.text         = element_text(size = 7),
+          legend.margin       = margin(0, 0, 0, 0),
+          legend.box.spacing  = unit(3, "pt"),
+          panel.spacing       = unit(2, "pt"))
+}
+
+p_sens <- panel(plot_df, "sens", "sensitivity")
+p_spec <- panel(plot_df, "spec", "specificity")
+
+p_sens
+p_spec
+
+library(patchwork)
+png("./Images/GRM_3stage.png",width=5000,height=3500,res=300)
+(p_sens / p_spec) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+dev.off()
+
+# The second way
+
+plot_df <- GRM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho    = droplevels(factor(rho, levels = union(rho_order, unique(rho)))),
+         method = factor(method, levels = methods_keep))
+
+med_df <- plot_df %>%
+  group_by(rho, sample_coef, K, J, method) %>%
+  summarise(sens = median(sens, na.rm = TRUE),
+            spec = median(spec, na.rm = TRUE), .groups = "drop") %>%
+  arrange(method, J)
+
+png("./Images/GRM_Comparison1.png",width=5000,height=3500,res=300)
+ggplot(plot_df, aes(spec, sens, colour = method)) +
+  geom_abline(slope = -1, intercept = 1, linetype = 3, colour = "grey65") +
+  geom_point(alpha = 0.12, size = 0.7) +                       # every replicate
+  geom_path(data = med_df, aes(group = method), linewidth = 0.45) +
+  geom_point(data = med_df, aes(size = J)) +                   # median, J by size
+  facet_grid(rho ~ sample_coef + K, labeller = label_both) +
+  scale_size_continuous(range = c(1.2, 3.2)) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "specificity", y = "sensitivity",
+       title = "GRM: support recovery by factor correlation") +
+  theme_bw()
+dev.off()
+
+
+# derive the header from the methods actually present, so the column count
+# can never drift out of step with the filter above
+methods_have <- methods_keep[methods_keep %in% unique(GRM_simu_result$method)]
+
+has_kE <- requireNamespace("kableExtra", quietly = TRUE)
+
+# kableExtra makes an HTML table, where MathJax needs \\( \\);
+# a plain markdown table goes through pandoc, which wants $ $
+tau_lab <- if (has_kE) "\\(\\tau_N\\)" else "$\\tau_N$"
+rho_lab <- if (has_kE) "\\(\\rho\\)"    else "$\\rho$"
+
+tab <- knitr::kable(GRM_sens_spec,
+                    col.names = c(rho_lab, tau_lab, "K",
+                                  rep(paste0("J=", J_levels), length(methods_have))),
+                    align = "c", escape = FALSE,
+                    caption = "GRM: mean sensitivity/specificity by factor correlation")
+
+if (has_kE) {
+  tab <- tab %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::add_header_above(
+      c(stats::setNames(3, " "),
+        stats::setNames(rep(length(J_levels), length(methods_have)), methods_have))) %>%
+    kableExtra::collapse_rows(columns = 1:2, valign = "middle")
+}
+tab
+```
+
+```{r}
+## tuning thr_vec for A and beta
+GPCM_simu_result <- data.frame(J = integer(), sample_coef = integer(), K = integer(), rho = character(), method=character(),
+                              prob_diff = numeric(), beta_diff = numeric(), Theta_diff = numeric(),
+                              sens=numeric(), spec=numeric(), load_diff = numeric(), card_diff = numeric(), rho_diff = numeric(),
+                              BIC = numeric(),time=numeric()) 
+
+cl <- makeCluster(6)
+clusterSetRNGStream(cl, 2026)   # independent worker RNG streams
+
+# workers append one line per finished replicate; watch live with
+#   tail -f GRM_sim_progress.log   (in Terminal, from the Simulation folder)
+prog_file <- file.path(getwd(), "GPCM_sim_progress.log")
+unlink(prog_file)
+
+clusterEvalQ(cl, {
+  Sys.setenv(
+    VECLIB_MAXIMUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    OMP_NUM_THREADS        = "1"
+  )
+
+  library(MASS)
+  library(clue)
+  library(GPArotation)
+  
+  setwd("/Users/travisyang/PhD/Repos_work/Poly_MIRT")
+  library(Rcpp)
+  sourceCpp("R/poly_mirt_rcpp.cpp")
+
+  NULL
+})
+funcs <- ls(envir = .GlobalEnv)
+funcs <- funcs[sapply(funcs, function(f) is.function(get(f)))]
+# Rcpp-compiled functions must NOT be exported. Their bodies are
+# .Call(<pointer: 0x..>, ..) and the pointer is NULL in another process, so
+# exporting them clobbers the copies sourceCpp() just built on the worker and
+# the next call fails with "NULL value passed as symbol address".
+rcpp_exports <- c("compute_PFf","tau_stats_grm","compute_H_gpcm","compute_H_grm",
+                  "compute_Z_grm_cpp","init_M_tilde","logl_grm","logl_gpcm")
+funcs <- setdiff(funcs, rcpp_exports)
+funcs <- c(funcs, "mvrnorm","solve_LSAP","GPFoblq")
+clusterExport(cl, funcs)
+
+for (J in J_values){
+  for (sample_coef in sample_values){
+    for (K in K_values){
+      for (rho_value in rho_set){
+        A_true <- generate_A(J,K,zero_prob=0.75)
+        beta_true <- generate_beta(J,C)
+
+        rho <- switch(
+            rho_value,
+            orth = 0,
+            low  = c(0.1, 0.4),
+            high = c(0.4, 0.6)
+          )
+        # draw the pairwise correlations ONCE per cell, so all nSim
+        # replicates share the same true correlation matrix
+        if (length(rho) == 2) {
+          rho <- runif(K*(K-1)/2, rho[1], rho[2])
+        }
+        clusterExport(cl, varlist=c("J", "C","sample_coef", "K","A_true","beta_true", "rho_value","rho","prog_file"))
+        
+        df_ls <- parLapplyLB(cl, 1:nSim, function(i){
+          N=sample_coef*J
+
+          Data <- generate_data(N,J,rho=rho,A_true,model="GPCM",C=C,beta_true=beta_true)
+          Y <- Data$Y
+          
+          lambda_max <- ifelse(sample_coef==10,J*5,J*12)
+          #if (rho_value == "high") {
+            #lambda_max <-ifelse(sample_coef==10,lambda_max, lambda_max*1.5)
+          #}
+          orthogonal <- ifelse(rho_value=="orth", TRUE, FALSE)
+          tol <- 1e-3 * K / (sample_coef * J)
+          
+          time_rot <- system.time({
+            result_rot <- GPCM_HiMMIRT(Y,K,C,rotation=T,orthogonal=T,
+                                       max_iter=2000,tol=tol)
+            
+            result_rot$A <- ifelse(abs(result_rot$A) < 0.3, 0, result_rot$A)
+            Lambda_rot <- ifelse(result_rot$A == 0, 0, 1)
+            
+            result_rot_refit  <- GPCM_CHiMIRT(Y, result_rot, Lambda_rot, K,
+                                              orthogonal = orthogonal,
+                                              max_iter = 2000, tol = tol)
+          })[3]
+          
+          vec_rot <- calResults(result_rot_refit,Data,N,J,K,C,model="GPCM")
+          
+
+          # shared warm start (used by card, autolasso, and the refits)
+          time_init <- system.time({
+            Params <- GPCM_HiMMIRT(Y,K,C,
+                           rotation=T,orthogonal=T,
+                           max_iter=200,tol=1e-3)
+          })[3]
+
+          time_lasso <- system.time({
+            result_list <- GPCM_autolasso_HiMIRT(Y,K,C,Params=Params,try_out=15,
+                                                lambda_range=c(0,lambda_max),
+                                                orthogonal=orthogonal)
+            # only card_diff and BIC are used to pick a lambda; calSelect()
+            # returns exactly those, skipping ref.perp() and the two
+            # N x J x C probability arrays calResults() would build per call
+            df <- as.data.frame(t(sapply(1:(length(result_list)-1),
+                        function(i) calSelect(result_list[[i]], Data, N, K))))
+
+            oracle_num <- which.min(df$card_diff)
+            BIC_num <- which.min(df$BIC)
+          })[3]
+
+          Lambda_oracle <- ifelse(result_list[[oracle_num]]$A==0,0,1)
+          Lambda_BIC <- ifelse(result_list[[BIC_num]]$A==0,0,1)
+
+          time_refit_BIC <- system.time({
+            result_BIC <- GPCM_CHiMIRT(Y,result_list[[BIC_num]],Lambda_BIC,K,
+                                        orthogonal=orthogonal,Z_output=F,
+                                        max_iter=2000,tol=tol)
+          })[3]
+          vec_BIC <- calResults(result_BIC,Data,N,J,K,C,model="GPCM")
+
+          vec_oracle <- calResults(result_list[[oracle_num]],
+                                   Data,N,J,K,C,model="GPCM")
+
+          time_seq <- system.time({
+            result_seq <- GPCM_card_HiMIRT(Y,K,C,Params=result_BIC,
+                                          random_start=F,
+                                          kappaC=sum(Lambda_BIC!=0),
+                                          orthogonal=orthogonal, tol=1e-5,
+                                          max_iter=200)
+
+            # iterative thresholding: drop nonzero loadings below .3,
+            # refit with the reduced cardinality, repeat
+            repeat {
+              small_num <- sum(abs(result_seq$A)<.3 & result_seq$A!=0)
+              kappaC_new <- sum(result_seq$A!=0)-small_num
+              if (small_num==0 || kappaC_new<K) break
+              result_seq <- GPCM_card_HiMIRT(Y,K,C,Params=result_seq,
+                                            random_start=F,
+                                            kappaC=kappaC_new,
+                                            orthogonal=orthogonal, tol=1e-5,
+                                            max_iter=200)
+            }
+          })[3]
+
+          vec_seq <- calResults(result_seq,Data,N,J,K,C,model="GPCM")
+
+          simu_res <- as.data.frame(rbind(vec_rot, vec_oracle, vec_BIC, vec_seq))
+          simu_res$J <- J
+          simu_res$sample_coef <- sample_coef
+          simu_res$K <- K
+          simu_res$rho <- rho_value
+          simu_res$method <- c("rotation","lasso_oracle",
+                               "lasso_BIC","Seq_ITC")
+          pipe_common <- time_init+time_lasso
+          simu_res$time <- c(time_rot,
+                             pipe_common,
+                             pipe_common+time_refit_BIC,
+                             pipe_common+time_refit_BIC+time_seq)
+
+          cat(sprintf("%s  J=%d K=%d tau= %.1f rho=%s  rep %d done\n",
+                      format(Sys.time(), "%H:%M:%S"), J, K, sample_coef, rho_value, i),
+              file = prog_file, append = TRUE)
+
+          return(simu_res)
+        })
+
+        res <- as.data.frame(do.call(rbind, df_ls))
+        GPCM_simu_result <- rbind(GPCM_simu_result,res)
+        
+        print(sprintf("J= %d tau= %.1f K= %d rho=%s  finished",
+                      J, sample_coef, K, rho_value))
+      }
+    }
+  }
+}
+
+stopCluster(cl)
+
+saveRDS(GPCM_simu_result, "./Data/GPCM_simu_result_75.rds")
+
+GPCM_simu_result <- readRDS("./Data/GPCM_simu_result_rot.rds")
+
+for (rho in rho_set) {
+  GPCM_simu_result_group <- GPCM_simu_result[
+    GPCM_simu_result$method == "lasso_BIC" &
+    GPCM_simu_result$rho == rho,
+  ]
+
+  plot_GPCM_results(
+    GPCM_simu_result_group,
+    save_path = paste0("./Images/GPCM_lasso_BIC_rho_", rho)
+  )
+}
+
+GPCM_simu_result_seq <- GPCM_simu_result[GPCM_simu_result$method=="Seq_ITC",]
+plot_GPCM_results(
+    GPCM_simu_result_seq,
+    save_path = "./Images/GPCM_seq_sparser"
+  )
+
+
+library(dplyr)
+library(tidyr)
+
+# mean sens/spec per condition (averaged over rho and replicates),
+# one "sens/spec" string per cell; columns grouped by method, then J
+GPCM_sens_spec <- GPCM_simu_result %>%
+  filter(method %in% c("lasso_BIC", "Seq_ITC")) %>%
+  group_by(method, sample_coef, K, J) %>%
+  summarise(sens = mean(sens, na.rm = TRUE),
+            spec = mean(spec, na.rm = TRUE), .groups = "drop") %>%
+  mutate(cell   = sprintf("%.3f/%.3f", sens, spec),
+         method = factor(method, levels = c("lasso_BIC", "Seq_ITC"))) %>%
+  select(-sens, -spec) %>%
+  pivot_wider(names_from = c(method, J), values_from = cell,
+              names_sort = TRUE, names_sep = "_J") %>%
+  arrange(sample_coef, K)
+
+J_levels <- sort(unique(GPCM_simu_result$J))
+
+has_kE <- requireNamespace("kableExtra", quietly = TRUE)
+
+# kableExtra makes an HTML table, where MathJax needs \\( \\);
+# a plain markdown table goes through pandoc, which wants $ $
+tau_lab <- if (has_kE) "\\(\\tau_N\\)" else "$\\tau_N$"
+
+tab <- knitr::kable(GPCM_sens_spec,
+                    col.names = c(tau_lab, "K", paste0("J=", J_levels), paste0("J=", J_levels)),
+                    align = "c", escape = FALSE,
+                    caption = "GPCM: mean sensitivity/specificity")
+
+if (has_kE) {
+  tab <- tab %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::add_header_above(c(" " = 2,
+                                   "lasso_BIC" = length(J_levels),
+                                   "Seq_ITC"   = length(J_levels))) %>%
+    kableExtra::collapse_rows(columns = 1, valign = "middle")
+}
+tab
+
+GPCM_simu_lasso_oracle_low <- GPCM_simu_result[GPCM_simu_result$method=="lasso_oracle"&GPCM_simu_result$rho=="low",]
+
+plot_simulation_results(GPCM_simu_lasso_oracle_low,
+                        save_path = "./Images/GPCM_lasso_oracle_low")
+
+GPCM_prob <- GPCM_simu_result[GPCM_simu_result$J==300&
+                             GPCM_simu_result$sample_coef==25&
+                             GPCM_simu_result$K==5,]
+
+GPCM_orth <- GPCM_simu_result[GPCM_simu_result$rho=="orth",]
+
+
+result <- aggregate(
+  time ~ J + K + sample_coef,
+  data = GPCM_simu_result,
+  FUN = median
+)
+
+colnames(result)[4] <- "Median time"
+
+knitr::kable(result, digits = 3)
+
+library(dplyr)
+library(tidyr)
+
+tables <- GPCM_simu_result %>%
+  group_by(sample_coef, J, K) %>%
+  summarise(
+    median_time = round(median(time, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = J,
+    values_from = median_time
+  )
+
+tables
+
+tables <- GPCM_simu_result %>%
+  group_by(sample_coef, rho, J, K) %>%
+  summarise(
+    median_time = round(median(time, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = J,
+    values_from = median_time
+  ) %>%
+  group_by(sample_coef, K) %>%
+  summarise(
+    across(
+      -rho,
+      ~ paste(.x[match(c("orth", "low", "high"), rho)], collapse = " / ")
+    ),
+    .groups = "drop"
+  )
+
+tables
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# mean sens/spec per condition, SPLIT over rho (averaged over replicates
+# only); one "sens/spec" string per cell. Rows are grouped by rho, then
+# tau_N and K; columns by method, then J.
+methods_keep <- c("rotation", "lasso_BIC", "Seq_ITC")
+rho_order    <- c("orth", "low", "high")
+
+GPCM_sens_spec <- GPCM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho = droplevels(factor(rho, levels = union(rho_order, unique(rho))))) %>%
+  group_by(rho, method, sample_coef, K, J) %>%
+  summarise(sens = mean(sens, na.rm = TRUE),
+            spec = mean(spec, na.rm = TRUE), .groups = "drop") %>%
+  mutate(cell   = sprintf("%.3f/%.3f", sens, spec),
+         method = factor(method, levels = methods_keep)) %>%
+  select(-sens, -spec) %>%
+  pivot_wider(names_from = c(method, J), values_from = cell,
+              names_sort = TRUE, names_sep = "_J") %>%
+  arrange(rho, sample_coef, K)
+
+J_levels <- sort(unique(GPCM_simu_result$J))
+
+library(ggplot2)
+
+plot_df <- GPCM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho    = droplevels(factor(rho, levels = union(rho_order, unique(rho)))),
+         method = factor(method, levels = methods_keep))
+
+med <- function(x) median(x, na.rm = TRUE)   # NA rows must not blank a median
+
+panel <- function(df, metric, ylab, ylim = NULL) {
+  ggplot(df, aes(factor(J), .data[[metric]], colour = method)) +
+    geom_hline(yintercept = 1, linetype = 3, colour = "grey65") +
+    geom_point(position = position_jitterdodge(jitter.width = 0.18,
+                                               dodge.width = 0.6),
+               alpha = 0.15, size = 0.7, show.legend = FALSE) +
+    stat_summary(fun = med, geom = "line", aes(group = method),
+                 position = position_dodge(0.6), linewidth = 0.5) +
+    stat_summary(fun = med, geom = "point", size = 2,
+                 position = position_dodge(0.6)) +
+    facet_grid(rho ~ sample_coef + K, labeller = label_both) +
+    coord_cartesian(ylim = ylim) +
+    labs(x = "J", y = ylab) +
+    guides(colour = guide_legend(ncol = 1,
+                                 override.aes = list(alpha = 1, size = 2.2))) +
+    theme_bw(base_size = 9) +
+    theme(legend.position     = "right",
+          legend.direction    = "vertical",
+          legend.key.size     = unit(9, "pt"),
+          legend.title        = element_text(size = 8),
+          legend.text         = element_text(size = 7),
+          legend.margin       = margin(0, 0, 0, 0),
+          legend.box.spacing  = unit(3, "pt"),
+          panel.spacing       = unit(2, "pt"))
+}
+
+p_sens <- panel(plot_df, "sens", "sensitivity")
+p_spec <- panel(plot_df, "spec", "specificity")
+
+p_sens
+p_spec
+
+library(patchwork)
+png("./Images/GPCM_3stage.png",width=5000,height=3500,res=300)
+(p_sens / p_spec) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+dev.off()
+
+# The second way
+
+plot_df <- GPCM_simu_result %>%
+  filter(method %in% methods_keep) %>%
+  mutate(rho    = droplevels(factor(rho, levels = union(rho_order, unique(rho)))),
+         method = factor(method, levels = methods_keep))
+
+med_df <- plot_df %>%
+  group_by(rho, sample_coef, K, J, method) %>%
+  summarise(sens = median(sens, na.rm = TRUE),
+            spec = median(spec, na.rm = TRUE), .groups = "drop") %>%
+  arrange(method, J)
+
+png("./Images/GRM_Comparison1.png",width=5000,height=3500,res=300)
+ggplot(plot_df, aes(spec, sens, colour = method)) +
+  geom_abline(slope = -1, intercept = 1, linetype = 3, colour = "grey65") +
+  geom_point(alpha = 0.12, size = 0.7) +                       # every replicate
+  geom_path(data = med_df, aes(group = method), linewidth = 0.45) +
+  geom_point(data = med_df, aes(size = J)) +                   # median, J by size
+  facet_grid(rho ~ sample_coef + K, labeller = label_both) +
+  scale_size_continuous(range = c(1.2, 3.2)) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "specificity", y = "sensitivity",
+       title = "GRM: support recovery by factor correlation") +
+  theme_bw()
+dev.off()
+```
+
+```{r}
+# Summarize rho_diff results
+library(dplyr)
+library(tidyr)
+
+# Seq_ITC only, GRM and GPCM together, pooled over replicates and
+# sample_coef. RMSE = sqrt(mean(rho_diff)), i.e. root of the mean squared
+# error over all correlations and replicates. "orth" is dropped: the
+# orthogonality constraint makes rho_diff ~0 by construction.
+rho_mse_tab <- bind_rows(GRM = GRM_simu_result, GPCM = GPCM_simu_result,
+                         .id = "model") %>%
+  filter(method == "Seq_ITC", rho != "orth") %>%
+  group_by(model, rho, K, J) %>%
+  summarise(rmse = sqrt(mean(rho_diff, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(model = factor(model, levels = c("GRM", "GPCM")),
+         rho   = factor(rho, levels = c("low", "high")),
+         rmse  = sprintf("%.3f", rmse)) %>%
+  pivot_wider(names_from = c(model, J), values_from = rmse,
+              names_sort = TRUE) %>%
+  arrange(rho, K)
+
+J_levels <- sort(unique(GRM_simu_result$J))
+has_kE   <- requireNamespace("kableExtra", quietly = TRUE)
+rho_lab  <- if (has_kE) "\\(\\rho\\) level" else "$\\rho$ level"
+
+tab <- knitr::kable(rho_mse_tab,
+                    col.names = c(rho_lab, "K", paste0("J=", J_levels), paste0("J=", J_levels)),
+                    align = "c", escape = FALSE,
+                    caption = "Seq_ITC: RMSE of factor correlations")
+
+if (has_kE) {
+  tab <- tab %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::add_header_above(c(" " = 2,
+                                   "GRM"  = length(J_levels),
+                                   "GPCM" = length(J_levels))) %>%
+    kableExtra::collapse_rows(columns = 1, valign = "middle")
+}
+tab
+```
+
+```{r}
+# Seq_ITC computation time, GRM and GPCM together, pooled over rho levels.
+# Each cell: median (Q1, Q3)
+time_tab <- bind_rows(GRM = GRM_simu_result, GPCM = GPCM_simu_result,
+                      .id = "model") %>%
+  filter(method == "Seq_ITC") %>%
+  group_by(model, sample_coef, K, J) %>%
+  summarise(med = median(time, na.rm = TRUE),
+            q1  = quantile(time, 0.25, na.rm = TRUE),
+            q3  = quantile(time, 0.75, na.rm = TRUE), .groups = "drop") %>%
+  mutate(model = factor(model, levels = c("GRM", "GPCM")),
+         cell  = sprintf("%.1f (%.1f, %.1f)", med, q1, q3)) %>%
+  select(model, sample_coef, K, J, cell) %>%
+  pivot_wider(names_from = c(model, J), values_from = cell,
+              names_sort = TRUE) %>%
+  arrange(sample_coef, K)
+
+J_levels <- sort(unique(GRM_simu_result$J))
+has_kE   <- requireNamespace("kableExtra", quietly = TRUE)
+tau_lab  <- if (has_kE) "\\(\\tau_N\\)" else "$\\tau_N$"
+
+tab <- knitr::kable(time_tab,
+                    col.names = c(tau_lab, "K", paste0("J=", J_levels), paste0("J=", J_levels)),
+                    align = "c", escape = FALSE,
+                    caption = "Seq_ITC: computation time in seconds, median (Q1, Q3)")
+
+if (has_kE) {
+  tab <- tab %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::add_header_above(c(" " = 2,
+                                   "GRM"  = length(J_levels),
+                                   "GPCM" = length(J_levels))) %>%
+    kableExtra::collapse_rows(columns = 1, valign = "middle")
+}
+tab
+```
